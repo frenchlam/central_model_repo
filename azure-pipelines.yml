@@ -1,0 +1,172 @@
+trigger:
+  branches:
+    include:
+    - '*'
+
+  tags:
+    include:
+      - '*'
+
+pool:
+  vmImage: 'ubuntu-18.04'
+
+stages:
+- stage: onPush
+  condition: not(startsWith(variables['Build.SourceBranch'], 'refs/tags/'))
+  jobs:
+  - job: onPushJob
+    steps:
+    - script: env | sort
+      displayName: 'Environment / Context'
+
+    - task: UsePythonVersion@0
+      displayName: 'Use Python 3.7'
+      inputs:
+        versionSpec: 3.7
+
+    - checkout: self
+      persistCredentials: true
+      clean: true
+      displayName: 'Checkout & Build.Reason: $(Build.Reason) & Build.SourceBranchName: $(Build.SourceBranchName)'
+
+    - script: |
+        python -m pip install --upgrade pip
+        pip install -r requirements.txt
+      displayName: 'Install python dependencies'
+
+    - script: pytest tests/unit
+      displayName: 'Run Unit tests'
+
+  - job: OnPullRequestJob
+    dependsOn: onPushJob
+    condition: and(succeeded(), eq(variables['Build.Reason'], 'PullRequest'))
+    steps:
+    - script: env | sort
+      displayName: 'Environment / Context'
+
+    - task: UsePythonVersion@0
+      displayName: 'Use Python 3.7'
+      inputs:
+        versionSpec: 3.7
+
+    - checkout: self
+      persistCredentials: true
+      clean: true
+
+    - script: pip install databricks-cli requests
+      displayName: 'Install python dependencies'
+
+    - script: |
+        echo "[crm-demo]" >> ~/.databrickscfg
+        echo "host = $QA_HOST" >> ~/.databrickscfg
+        echo "token = $QA_TOKEN" >> ~/.databrickscfg
+      env:
+        QA_HOST: $(QA_HOST)
+        QA_TOKEN: $(QA_TOKEN)
+      displayName: 'Set up Databricks cli for QA workspace'
+
+    - script: python setup.py sdist bdist_wheel
+      displayName: 'Build python module'
+
+    - script: databricks fs cp -r --overwrite $(Build.Repository.LocalPath)/dist dbfs:/projects/Central-Model-Registry/versions --profile crm-demo
+      displayName: 'Copy build to QA DBFS'
+
+    - script: databricks workspace import_dir -o -e $(Build.Repository.LocalPath)/tests/integration /projects/Central-Model-Registry --profile crm-demo
+      displayName: 'Copy test notebooks to QA workspace'
+
+    - script: python $(Build.Repository.LocalPath)/ci-cd-scripts/update-test-jobs-confs.py --url $QA_HOST --pat $QA_TOKEN --path $(Build.Repository.LocalPath)/dist
+      env:
+        QA_HOST: $(QA_HOST)
+        QA_TOKEN: $(QA_TOKEN)
+      displayName: 'Update test jobs configurations'
+
+    - script: python $(Build.Repository.LocalPath)/ci-cd-scripts/test-model-integration.py --url $QA_HOST --pat $QA_TOKEN --path $(Build.Repository.LocalPath)/model.json
+      env:
+        QA_HOST: $(QA_HOST)
+        QA_TOKEN: $(QA_TOKEN)
+      displayName: 'Test model integration'
+
+    - script: python $(Build.Repository.LocalPath)/ci-cd-scripts/test-model-performance.py --qa-url $QA_HOST --qa-pat $QA_TOKEN --cmr-url $CMR_HOST --cmr-pat $CMR_TOKEN --path $(Build.Repository.LocalPath)/model.json
+      env:
+        QA_HOST: $(QA_HOST)
+        QA_TOKEN: $(QA_TOKEN)
+        CMR_HOST: $(CMR_HOST)
+        CMR_TOKEN: $(CMR_TOKEN)
+      displayName: 'Test model performance'
+
+- stage: onDevMerge
+  dependsOn: onPush
+  condition: and(succeeded(), eq(variables['Build.SourceBranch'], 'refs/heads/development'))
+  jobs:
+  - job: onDevMergeJob
+    pool:
+      vmImage: 'ubuntu-18.04'
+
+    steps:
+      - script: env | sort
+        displayName: 'Environment / Context'
+
+      - task: UsePythonVersion@0
+        displayName: 'Use Python 3.7'
+        inputs:
+          versionSpec: 3.7
+
+      - checkout: self
+        persistCredentials: true
+        clean: true
+        displayName: 'Checkout & Build.Reason: $(Build.Reason) & Build.SourceBranchName: $(Build.SourceBranchName)'
+
+      - script: pip install requests
+        displayName: 'Install python librairies'
+
+      - script: python $(Build.Repository.LocalPath)/ci-cd-scripts/transition-new-model-to-staging.py --url $CMR_HOST --pat $CMR_TOKEN --path $(Build.Repository.LocalPath)/model.json
+        env:
+          CMR_HOST: $(CMR_HOST)
+          CMR_TOKEN: $(CMR_TOKEN)
+        displayName: 'Transition new model version, if any, to Staging'
+
+
+- stage: onRelease
+  condition: startsWith(variables['Build.SourceBranch'], 'refs/tags/')
+  jobs:
+  - job: onReleaseJob
+    pool:
+      vmImage: 'ubuntu-18.04'
+
+    steps:
+      - script: env | sort
+        displayName: 'Environment / Context'
+
+      - task: UsePythonVersion@0
+        displayName: 'Use Python 3.7'
+        inputs:
+          versionSpec: 3.7
+
+      - checkout: self
+        persistCredentials: true
+        clean: true
+        displayName: 'Checkout & Build.Reason: $(Build.Reason) & Build.SourceBranchName: $(Build.SourceBranchName)'
+
+      - script: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+        displayName: 'Install python dependencies'
+
+      - script: python setup.py sdist bdist_wheel
+        displayName: 'Build python module'
+
+      - script: |
+          mkdir -p $(Build.ArtifactStagingDirectory)/ci-cd-scripts
+          mkdir -p $(Build.ArtifactStagingDirectory)/notebooks
+          mkdir -p $(Build.ArtifactStagingDirectory)/dist
+
+          cp $(Build.Repository.LocalPath)/model.json $(Build.ArtifactStagingDirectory)/
+          cp $(Build.Repository.LocalPath)/ci-cd-scripts/* $(Build.ArtifactStagingDirectory)/ci-cd-scripts/
+          cp $(Build.Repository.LocalPath)/central_model_registry/notebooks/inference.py $(Build.ArtifactStagingDirectory)/notebooks/
+          cp $(Build.Repository.LocalPath)/dist/* $(Build.ArtifactStagingDirectory)/dist/
+        displayName: 'Copy notebooks, model.json, and transition scripts to common directory'
+
+      - task: PublishBuildArtifacts@1
+        inputs:
+          pathToPublish: '$(Build.ArtifactStagingDirectory)'
+          ArtifactName: '$(Build.Repository.Name)'
